@@ -2,9 +2,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <array>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <atomic>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <utility>
 
 #include "game_settings.h"
@@ -16,6 +20,7 @@
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "common/string_util.h"
+#include "core/arm/debug.h"
 #include "core/arm/exclusive_monitor.h"
 #include "core/core.h"
 
@@ -232,8 +237,39 @@ struct System::Impl {
         network_clock->SetCurrentTime(new_time);
     }
 
+    // EDEN_NX2_THREAD_DUMP=<seconds>: that long after the first Run, pause once, log every
+    // application thread's state and backtrace (where a stalled game waits), then resume.
+    void StartThreadDump() {
+        static const char* const value = std::getenv("EDEN_NX2_THREAD_DUMP");
+        if (!value || thread_dump.joinable()) {
+            return;
+        }
+        const auto delay = std::chrono::seconds{std::strtoul(value, nullptr, 10)};
+        thread_dump = std::jthread([this, delay](std::stop_token stop) {
+            std::mutex mutex;
+            std::unique_lock lock{mutex};
+            if (std::condition_variable_any{}.wait_for(lock, stop, delay, [] { return false; }) ||
+                stop.stop_requested()) {
+                return;
+            }
+            Pause();
+            if (auto* const process = kernel.ApplicationProcess()) {
+                for (const auto& thread : process->GetThreadList()) {
+                    std::string frames;
+                    for (const auto& entry : Core::GetBacktrace(&thread)) {
+                        frames += fmt::format(" {:x}", entry.original_address);
+                    }
+                    LOG_INFO(Core, "Guest thread {} {}:{}", thread.GetThreadId(),
+                             Core::GetThreadState(&thread), frames);
+                }
+            }
+            Run();
+        });
+    }
+
     void Run() {
         std::unique_lock<std::mutex> lk(suspend_guard);
+        StartThreadDump();
 
         kernel.SuspendEmulation(false);
         core_timing.SyncPause(false);
@@ -567,6 +603,7 @@ struct System::Impl {
     bool exit_locked : 1 = false;
     bool exit_requested : 1 = false;
     bool nvdec_active : 1 = false;
+    std::jthread thread_dump;
 
     void EnsureGeneralChannelInitialized(System& system) {
         if (!general_channel_event) {

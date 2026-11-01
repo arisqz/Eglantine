@@ -76,7 +76,8 @@ constexpr inline SystemArchiveDescriptor GetSystemArchive(u64 title_id) {
 
 VirtualFile SynthesizeSystemArchive(const u64 title_id) {
     auto const desc = GetSystemArchive(title_id);
-    LOG_INFO(Service_FS, "Synthesizing system archive '{}' ({:#016x}).", desc.name, title_id);
+    LOG_INFO(Service_FS, "Synthesizing system archive '{}' ({:#016x}).",
+             desc.name != nullptr ? desc.name : "unknown", title_id);
     if (desc.supplier != nullptr) {
         if (auto const dir = desc.supplier(); dir != nullptr) {
             if (auto const romfs = CreateRomFS(dir); romfs != nullptr) {

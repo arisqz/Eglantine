@@ -16,7 +16,8 @@
 #include <ranges>
 
 namespace AudioCore {
-constexpr u32 CurrentRevision = 15;
+// Revision 16 (newer Switch 2 SDKs) is accepted with revision 15's features.
+constexpr u32 CurrentRevision = 16;
 
 enum class SupportTags {
     CommandProcessingTimeEstimatorVersion4,
