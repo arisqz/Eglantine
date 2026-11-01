@@ -118,6 +118,8 @@ namespace Core {
 
 /// Frames the guest has presented (Switch 2 vi2 present calls); input replay is locked to it.
 extern std::atomic<u64> g_nx2_present_count;
+/// TEMP: steady_clock ticks when the vi2 present started waiting for a GPU fence, 0 if not.
+extern std::atomic<s64> g_nx2_present_wait_since;
 
 class CpuManager;
 class Debugger;

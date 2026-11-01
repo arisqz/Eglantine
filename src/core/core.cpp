@@ -77,6 +77,7 @@
 namespace Core {
 
 std::atomic<u64> g_nx2_present_count{};
+std::atomic<s64> g_nx2_present_wait_since{}; // TEMP
 
 FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
                                          const std::string& path) {

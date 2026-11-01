@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <chrono>
+#include <deque>
 #include <functional>
 #include <atomic>
 #include <condition_variable>
@@ -104,6 +106,10 @@ struct SynchState final {
     CommandQueue queue;
     u64 last_fence{};
     std::atomic<u64> signaled_fence{};
+    /// The last command the GPU thread has finished parsing (not necessarily executed).
+    std::atomic<u64> parsed_fence{};
+    /// Switch 2: command lists not yet parsed by the GPU thread, with when they were pushed.
+    std::deque<std::pair<u64, std::chrono::steady_clock::time_point>> queued_lists;
     std::condition_variable_any cv;
 };
 
@@ -139,6 +145,9 @@ public:
 private:
     /// Pushes a command to be executed by the GPU thread
     u64 PushCommand(CommandData&& command_data, bool block, bool is_async);
+
+    /// Holds a Switch 2 submission while the GPU thread lags too far behind.
+    void WaitForQueuedLists();
 
     Core::System& system;
     VideoCore::RasterizerInterface* rasterizer = nullptr;

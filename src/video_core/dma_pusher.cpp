@@ -147,7 +147,8 @@ bool DmaPusher::Step() {
                 }
             }
             if (dma_pushbuffer_subindex < command_list.submit_hashes.size()) {
-                CheckSubmitHash(header, command_list.submit_hashes[dma_pushbuffer_subindex]);
+                CheckSubmitHash(header, command_list.submit_hashes[dma_pushbuffer_subindex],
+                                command_list.submit_time);
             }
         }
         // A resumed entry is read again: the words after the acquire may be new by now.
@@ -454,16 +455,34 @@ void DmaPusher::ReportUnboundSubchannel() {
     }
 }
 
-void DmaPusher::CheckSubmitHash(const CommandListHeader& header, u64 submit_hash) {
-    std::vector<u32> words(header.size);
+void DmaPusher::CheckSubmitHash(const CommandListHeader& header, u64 submit_hash,
+                                std::chrono::steady_clock::time_point submit_time) {
+    static thread_local std::vector<u32> words;
+    words.resize(header.size);
     memory_manager.ReadBlockUnsafe(header.addr, words.data(), words.size() * sizeof(u32));
     static std::atomic<u64> checked{};
     static std::atomic<u64> changed{};
     ++checked;
+    { // TEMP: report a channel parsing work submitted long ago, at most once per 2 s
+        const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - submit_time).count();
+        static std::chrono::steady_clock::time_point last_report{};
+        if (submit_time.time_since_epoch().count() != 0 && age > 500 &&
+            std::chrono::steady_clock::now() - last_report > std::chrono::seconds{2}) {
+            last_report = std::chrono::steady_clock::now();
+            LOG_WARNING(HW_GPU, "TEMP ch {} parses an entry submitted {} ms ago ({} lists queued)",
+                        channel_state.bind_id, age, dma_pushbuffer.size());
+        }
+    }
     if (HashPushbufferWords(words) != submit_hash) {
-        if (changed.fetch_add(1) < 16) {
-            LOG_WARNING(HW_GPU, "pushbuffer entry {:#x}+{:#x} changed between submit and execution",
-                        header.addr.Value(), header.size.Value());
+        if (changed.fetch_add(1) < 40) {
+            LOG_WARNING(HW_GPU, "pushbuffer entry {:#x}+{:#x} changed between submit and execution "
+                        "(TEMP ch {} level {} sync {}, submitted {} ms ago, {} lists queued)",
+                        header.addr.Value(), header.size.Value(), channel_state.bind_id,
+                        header.is_push_buffer.Value(), header.sync.Value(),
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - submit_time).count(),
+                        dma_pushbuffer.size());
         }
     }
     if ((checked % 20000) == 0) {
@@ -529,8 +548,11 @@ void DmaPusher::DumpCurrentEntry(const char* reason) {
     const size_t first = dma_pushbuffer_subindex >= 2 ? dma_pushbuffer_subindex - 2 : 0;
     for (size_t i = first; i <= dma_pushbuffer_subindex && i < lists.size(); ++i) {
         const CommandListHeader& header = lists[i];
-        LOG_WARNING(HW_GPU, "  entry {} of {}: addr={:#x} size={:#x}", i, lists.size(),
-                    header.addr.Value(), header.size.Value());
+        const auto device = memory_manager.GpuToCpuAddress(header.addr);
+        LOG_WARNING(HW_GPU, "  entry {} of {}: addr={:#x} size={:#x} raw={:#018x} gpu-modified={}", i,
+                    lists.size(), header.addr.Value(), header.size.Value(), header.raw,
+                    device && rasterizer->MustFlushRegion(*device, header.size * sizeof(u32),
+                                                          VideoCommon::CacheType::All));
         for (u64 word = 0; word < std::min<u64>(header.size, 0x80); word += 8) {
             std::string gpu_line;
             std::string cpu_line;

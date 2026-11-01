@@ -1182,6 +1182,7 @@ private:
                 std::condition_variable cv;
                 bool done{};
             };
+            Core::g_nx2_present_wait_since = start.time_since_epoch().count(); // TEMP
             auto wake = std::make_shared<Wake>();
             syncpoints.RegisterGuestAction(fence_id, fence_value, [wake] {
                 {
@@ -1196,6 +1197,7 @@ private:
                 wake->cv.wait_for(lk, std::chrono::milliseconds{50});
             }
         }
+        Core::g_nx2_present_wait_since = 0; // TEMP
         if (!syncpoints.IsReadyGuest(fence_id, fence_value) && m_wait_timeouts++ < 64) {
             LOG_WARNING(Service, "nx2:vi2 present #{} fence ({}, {}) not reached in 4 s (now {})",
                         m_presents, fence_id, fence_value, syncpoints.GetGuestSyncpointValue(fence_id));

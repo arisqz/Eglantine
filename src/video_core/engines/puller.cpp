@@ -4,7 +4,11 @@
 // SPDX-FileCopyrightText: 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <array>
 #include <atomic>
+#include <chrono>
+#include <mutex>
+#include <string>
 #include <cstdlib>
 
 #include "common/assert.h"
@@ -59,6 +63,39 @@ void DrainBack() {
     VideoCommon::GpuSplit::Get().Drain();
 }
 
+// TEMP: the last semaphore releases the front parsed, to name the writer of a stalled acquire.
+struct TempRelease {
+    GPUVAddr address;
+    u32 value;
+    s32 channel;
+    std::chrono::steady_clock::time_point when;
+};
+std::mutex temp_release_mutex;
+std::array<TempRelease, 4096> temp_releases{};
+size_t temp_release_count{};
+
+void TempRecordRelease(GPUVAddr address, u32 value, s32 channel) {
+    std::scoped_lock lk{temp_release_mutex};
+    temp_releases[temp_release_count++ % temp_releases.size()] = {
+        address & ~GPUVAddr{3}, value, channel, std::chrono::steady_clock::now()};
+}
+
+std::string TempDescribeReleases(GPUVAddr address) {
+    std::scoped_lock lk{temp_release_mutex};
+    std::string text;
+    const auto now = std::chrono::steady_clock::now();
+    u32 found = 0;
+    for (size_t i = 0; i < std::min(temp_release_count, temp_releases.size()) && found < 4; ++i) {
+        const auto& r = temp_releases[(temp_release_count - 1 - i) % temp_releases.size()];
+        if (r.address == (address & ~GPUVAddr{3})) {
+            ++found;
+            text += fmt::format(" [ch {} wrote {:#x} {} ms ago]", r.channel, r.value,
+                                std::chrono::duration_cast<std::chrono::milliseconds>(now - r.when).count());
+        }
+    }
+    return found ? text : std::string(" [no GPU release in the last 4096: CPU-written?]");
+}
+
 } // Anonymous namespace
 
 bool Puller::PendingAcquire::Matches(u32 current) const {
@@ -97,6 +134,17 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (!pending_acquire->reported &&
         std::chrono::steady_clock::now() - pending_acquire->since > std::chrono::seconds{2}) {
         pending_acquire->reported = true;
+        { // TEMP
+            const s64 since = Core::g_nx2_present_wait_since.load();
+            LOG_WARNING(HW_GPU, "TEMP stalled channel {} on {:#x}: writers{}; present {}",
+                        dma_pusher.channel_state.bind_id, pending_acquire->address,
+                        TempDescribeReleases(pending_acquire->address),
+                        since == 0 ? std::string("not waiting")
+                                   : fmt::format("waiting for {} ms",
+                                                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                     std::chrono::steady_clock::now().time_since_epoch() -
+                                                     std::chrono::steady_clock::duration{since}).count()));
+        }
         const auto device = dma_pusher.memory_manager.GpuToCpuAddress(pending_acquire->address);
         LOG_WARNING(HW_GPU, "Channel {} waits on semaphore {:#x} (op {}, {:#x}, now {:#x}) for 2 s; "
                     "device {:#x}, buffer cache holds GPU data: {}, words {:08x} {:08x} {:08x} {:08x}",
@@ -114,6 +162,15 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
 bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     if (!CanResumeAcquire(dma_pusher)) {
         return false;
+    }
+    if (pending_acquire) { // TEMP
+        const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - pending_acquire->since).count();
+        if (waited > 250) {
+            LOG_WARNING(HW_GPU, "TEMP channel {} resumed semaphore {:#x} (op {}, {:#x}) after {} ms",
+                        dma_pusher.channel_state.bind_id, pending_acquire->address,
+                        pending_acquire->operation, pending_acquire->value, waited);
+        }
     }
     pending_acquire.reset();
     Nx2SemaphoreWaiters::Get().Remove(this);
@@ -212,6 +269,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
     if (op == GpuSemaphoreOperation::WriteLong) {
         const GPUVAddr sequence_address{regs.semaphore_address.SemaphoreAddress()};
         const u32 payload = regs.semaphore_sequence;
+        TempRecordRelease(sequence_address, payload, dma_pusher.channel_state.bind_id);
         // RELEASE_SIZE (bit 24) set means a 4-byte release without the timestamp; writing 16
         // bytes there clobbers the words next to it (Switch 2 packs semaphores tightly).
         const auto properties = g_nx2_ampere && (regs.semaphore_trigger & (1U << 24)) != 0
@@ -296,6 +354,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
 void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
     const GPUVAddr sequence_address{regs.semaphore_address.SemaphoreAddress()};
     const u32 payload = regs.semaphore_release;
+    TempRecordRelease(sequence_address, payload, dma_pusher.channel_state.bind_id);
     OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, payload] {
         rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload,
                           VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
@@ -325,6 +384,7 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
     const u32 payload = regs.reg_array[0x19];
     const u32 operation = argument & 7;
     if (operation == 1) { // RELEASE
+        TempRecordRelease(address, payload, dma_pusher.channel_state.bind_id);
         OnBack([rasterizer = dma_pusher.rasterizer, address, payload] {
             rasterizer->Query(address, VideoCommon::QueryType::Payload,
                               VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);

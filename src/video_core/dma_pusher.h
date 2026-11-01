@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <condition_variable>
 #include <optional>
 #include <span>
@@ -117,6 +118,7 @@ struct CommandList final {
     boost::container::small_vector<CommandHeader, 512> prefetch_command_list;
     /// EDEN_NX2_PB_CHECK: hash of each entry's words when it was submitted.
     std::vector<u64> submit_hashes;
+    std::chrono::steady_clock::time_point submit_time{}; // TEMP
 };
 
 /// FNV-1a over pushbuffer words (EDEN_NX2_PB_CHECK).
@@ -180,7 +182,8 @@ public:
     /// Logs the GPFIFO entry being processed (and the one before it), read through the GPU MMU
     /// and straight from guest memory, to find pushbuffer desyncs. Debug aid for Switch 2.
     void DumpCurrentEntry(const char* reason);
-    void CheckSubmitHash(const CommandListHeader& header, u64 submit_hash);
+    void CheckSubmitHash(const CommandListHeader& header, u64 submit_hash,
+                         std::chrono::steady_clock::time_point submit_time);
     void RecordParsedEntry(const CommandListHeader& header, std::span<const CommandHeader> commands);
 
 private:
